@@ -1,0 +1,21 @@
+{
+    "shops": {
+        "1519610262183870597": {
+            "name": "sst",
+            "paypal": "",
+            "items": {},
+            "orders": {},
+            "next_order_id": 1,
+            "category_id": 1532467877721149503,
+            "catalogue_channel_id": 1532467879105134622,
+            "payment_channel_id": 1532467880426344539,
+            "order_channel_id": 1532467881546092615,
+            "admin_channel_id": 1532467882301067336
+        }
+    },
+    "balances": {
+        "1519610262183870597": {
+            "1509994351575695571": 6000
+        }
+    }
+}

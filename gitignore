@@ -1,0 +1,7 @@
+# Ne jamais commit ces fichiers sur GitHub (données sensibles / locales)
+data.json
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
