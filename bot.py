@@ -22,6 +22,7 @@ import os
 import discord
 from discord import app_commands
 from discord.ext import commands
+from keep_alive import keep_alive
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -602,4 +603,5 @@ async def permission_error_handler(interaction: discord.Interaction, error):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    keep_alive()  # Démarre le serveur web keep-alive (utile sur Replit)
     bot.run(TOKEN)
