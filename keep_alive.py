@@ -1,12 +1,4 @@
-"""
-Petit serveur web pour garder le bot en vie sur Replit.
----------------------------------------------------------
-Replit met en veille les projets gratuits qui ne reçoivent aucune requête web.
-Ce serveur Flask tourne en parallèle du bot Discord et répond à un simple
-ping HTTP. En connectant un service comme cron-job.org pour appeler cette
-URL toutes les 5 minutes, le Repl reste actif 24/7.
-"""
-
+import os
 from flask import Flask
 from threading import Thread
 
@@ -19,7 +11,8 @@ def home():
 
 
 def run():
-    app.run(host="0.0.0.0", port=8080)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
 
 
 def keep_alive():
