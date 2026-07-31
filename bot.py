@@ -17,6 +17,7 @@ Commandes disponibles :
 Stockage : fichier JSON local (data.json).
 """
 
+import asyncio
 import json
 import os
 import discord
@@ -133,6 +134,7 @@ async def create_shop(interaction: discord.Interaction, nom: str = "Ma Boutique"
     payment_channel = await guild.create_text_channel("💳-infos-paiement", category=category, overwrites=read_only)
     order_channel = await guild.create_text_channel("🛍️-commander", category=category, overwrites=can_write)
     admin_channel = await guild.create_text_channel("📦-commandes-admin", category=category, overwrites=admin_only)
+    ticket_category = await guild.create_category("🎫 Tickets", overwrites=admin_only)
 
     data["shops"][guild_id] = {
         "name": nom,
@@ -145,6 +147,7 @@ async def create_shop(interaction: discord.Interaction, nom: str = "Ma Boutique"
         "payment_channel_id": payment_channel.id,
         "order_channel_id": order_channel.id,
         "admin_channel_id": admin_channel.id,
+        "ticket_category_id": ticket_category.id,
     }
     save_data(data)
 
@@ -418,32 +421,58 @@ async def shop_cmd(interaction: discord.Interaction):
 
 
 # ---------------------------------------------------------------------------
-# /buy -> crée une commande en attente de paiement
+# Fonction commune : création d'un ticket de commande
 # ---------------------------------------------------------------------------
 
-@bot.tree.command(name="buy", description="Commander un article de la boutique")
-@app_commands.describe(nom="Nom de l'article", quantite="Quantité")
-async def buy(interaction: discord.Interaction, nom: str, quantite: int = 1):
+async def create_order_ticket(interaction: discord.Interaction, shop: dict, item_key: str, quantite: int = 1):
     data = load_data()
-    shop = get_shop(data, interaction.guild_id)
+    shop = get_shop(data, interaction.guild_id)  # relit les données à jour
 
-    if not shop or nom.lower() not in shop["items"]:
-        await interaction.response.send_message("❌ Cet article n'existe pas.", ephemeral=True)
+    if not shop or item_key not in shop["items"]:
+        await interaction.response.send_message("❌ Cet article n'existe plus.", ephemeral=True)
         return
 
-    if quantite <= 0:
-        await interaction.response.send_message("❌ La quantité doit être supérieure à 0.", ephemeral=True)
-        return
-
-    item = shop["items"][nom.lower()]
+    item = shop["items"][item_key]
 
     if item["stock"] != -1 and item["stock"] < quantite:
         await interaction.response.send_message(f"❌ Stock insuffisant (reste {item['stock']}).", ephemeral=True)
         return
 
+    await interaction.response.defer(ephemeral=True)
+
     total = round(item["price"] * quantite, 2)
     order_id = str(shop["next_order_id"])
     shop["next_order_id"] += 1
+
+    guild = interaction.guild
+    ticket_category = guild.get_channel(shop.get("ticket_category_id")) if shop.get("ticket_category_id") else None
+
+    if ticket_category is None:
+        # La boutique a été créée avant l'ajout du système de tickets : on crée la catégorie maintenant.
+        admin_only = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
+        for role in guild.roles:
+            if role.permissions.administrator:
+                admin_only[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+        ticket_category = await guild.create_category("🎫 Tickets", overwrites=admin_only)
+        shop["ticket_category_id"] = ticket_category.id
+        save_data(data)
+
+    # Permissions du ticket : uniquement le client + les admins
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+        interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+    }
+    for role in guild.roles:
+        if role.permissions.administrator:
+            overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+
+    ticket_channel = await guild.create_text_channel(
+        f"ticket-{order_id}-{interaction.user.name}"[:95],
+        category=ticket_category,
+        overwrites=overwrites,
+        reason=f"Ticket de commande #{order_id}",
+    )
 
     shop["orders"][order_id] = {
         "user_id": interaction.user.id,
@@ -451,6 +480,7 @@ async def buy(interaction: discord.Interaction, nom: str, quantite: int = 1):
         "quantite": quantite,
         "total": total,
         "status": "en attente de paiement",
+        "ticket_channel_id": ticket_channel.id,
     }
 
     if item["stock"] != -1:
@@ -459,26 +489,134 @@ async def buy(interaction: discord.Interaction, nom: str, quantite: int = 1):
     save_data(data)
     await refresh_catalogue(shop)
 
-    # Notifie le salon admin
+    # Notifie le salon admin (log global)
     admin_channel = bot.get_channel(shop["admin_channel_id"])
     if admin_channel:
         embed = discord.Embed(title=f"🆕 Nouvelle commande #{order_id}", color=discord.Color.orange())
         embed.add_field(name="Client", value=interaction.user.mention, inline=True)
         embed.add_field(name="Article", value=f"{quantite}x {item['display_name']}", inline=True)
         embed.add_field(name="Total", value=fmt_price(total), inline=True)
+        embed.add_field(name="Ticket", value=ticket_channel.mention, inline=False)
         embed.set_footer(text="Utilise /confirm_paiement une fois le paiement reçu")
         await admin_channel.send(embed=embed)
 
-    embed = discord.Embed(
-        title=f"🧾 Commande #{order_id} créée",
+    # Message d'accueil dans le ticket
+    ticket_embed = discord.Embed(
+        title=f"🧾 Ticket — Commande #{order_id}",
         description=(
-            f"**{quantite}x {item['display_name']}** — **{fmt_price(total)}**\n\n"
+            f"Bienvenue {interaction.user.mention} !\n\n"
+            f"**Article :** {quantite}x {item['display_name']}\n"
+            f"**Total :** {fmt_price(total)}\n\n"
             f"Utilise `/pay montant:{total}` pour obtenir le lien de paiement.\n"
-            f"⚠️ N'oublie pas d'indiquer **#{order_id}** en note de ton paiement PayPal."
+            f"⚠️ Indique **#{order_id}** en note de ton paiement PayPal.\n\n"
+            f"Un membre de l'équipe va s'occuper de toi ici. Une fois le paiement confirmé, "
+            f"ce ticket sera fermé avec `/close_ticket`."
         ),
         color=discord.Color.green(),
     )
-    await interaction.response.send_message(embed=embed)
+    await ticket_channel.send(embed=ticket_embed)
+
+    await interaction.followup.send(
+        f"✅ Ta commande **#{order_id}** a été créée ! Rendez-vous dans {ticket_channel.mention}.",
+        ephemeral=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Menu déroulant de sélection d'article
+# ---------------------------------------------------------------------------
+
+class ItemSelect(discord.ui.Select):
+    def __init__(self, shop: dict):
+        options = []
+        for key, item in shop["items"].items():
+            if item["stock"] == 0:
+                continue  # article en rupture de stock : on ne le propose pas
+            label = f"{item['display_name']} — {fmt_price(item['price'])}"
+            options.append(discord.SelectOption(label=label[:100], description=item["description"][:100], value=key))
+
+        if not options:
+            options = [discord.SelectOption(label="Aucun article disponible", value="__none__")]
+
+        super().__init__(placeholder="Choisis un article à acheter...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "__none__":
+            await interaction.response.send_message("❌ Aucun article disponible pour le moment.", ephemeral=True)
+            return
+
+        data = load_data()
+        shop = get_shop(data, interaction.guild_id)
+        await create_order_ticket(interaction, shop, self.values[0], quantite=1)
+
+
+class ShopSelectView(discord.ui.View):
+    def __init__(self, shop: dict):
+        super().__init__(timeout=120)
+        self.add_item(ItemSelect(shop))
+
+
+# ---------------------------------------------------------------------------
+# /buy -> affiche un menu déroulant pour choisir l'article à commander
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="buy", description="Choisir un article à acheter (ouvre un ticket privé)")
+async def buy(interaction: discord.Interaction):
+    data = load_data()
+    shop = get_shop(data, interaction.guild_id)
+
+    if not shop:
+        await interaction.response.send_message("❌ Aucune boutique n'existe.", ephemeral=True)
+        return
+
+    if not shop["items"]:
+        await interaction.response.send_message("❌ Le catalogue est vide pour le moment.", ephemeral=True)
+        return
+
+    view = ShopSelectView(shop)
+    await interaction.response.send_message(
+        "🛍️ Sélectionne l'article que tu veux commander :", view=view, ephemeral=True
+    )
+
+
+# ---------------------------------------------------------------------------
+# /close_ticket -> ferme (supprime) un salon de ticket
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="close_ticket", description="Ferme le ticket de commande actuel")
+async def close_ticket(interaction: discord.Interaction):
+    data = load_data()
+    shop = get_shop(data, interaction.guild_id)
+
+    if not shop:
+        await interaction.response.send_message("❌ Aucune boutique n'existe.", ephemeral=True)
+        return
+
+    # Vérifie que la commande est bien lancée dans un salon de ticket
+    order_id = None
+    for oid, o in shop["orders"].items():
+        if o.get("ticket_channel_id") == interaction.channel_id:
+            order_id = oid
+            break
+
+    if order_id is None:
+        await interaction.response.send_message("❌ Cette commande doit être utilisée dans un salon de ticket.", ephemeral=True)
+        return
+
+    order = shop["orders"][order_id]
+    is_admin = interaction.user.guild_permissions.administrator
+    is_owner = interaction.user.id == order["user_id"]
+
+    if not (is_admin or is_owner):
+        await interaction.response.send_message("🚫 Tu n'as pas la permission de fermer ce ticket.", ephemeral=True)
+        return
+
+    await interaction.response.send_message("🔒 Fermeture du ticket dans 5 secondes...")
+    await asyncio.sleep(5)
+    try:
+        await interaction.channel.delete(reason=f"Ticket fermé par {interaction.user}")
+    except discord.HTTPException:
+        pass
 
 
 # ---------------------------------------------------------------------------
