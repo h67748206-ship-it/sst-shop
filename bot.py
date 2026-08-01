@@ -407,28 +407,47 @@ async def remove_item(interaction: discord.Interaction, nom: str):
 # Catalogue -> republication automatique dans le salon catalogue
 # ---------------------------------------------------------------------------
 
-async def build_catalogue_embed(shop: dict) -> discord.Embed:
-    embed = discord.Embed(title=f"🛒 {shop['name']} — Catalogue", color=discord.Color.blurple())
+async def build_catalogue_embeds(shop: dict) -> list:
+    """Construit une liste d'embeds, un par article, chacun avec sa propre image si disponible.
+    Discord limite à 10 embeds par message, donc on ne prend que les 10 premiers."""
     if not shop["items"]:
-        embed.description = "Le catalogue est vide pour le moment."
-    else:
-        for item in shop["items"].values():
-            stock_txt = "Illimité" if item["stock"] == -1 else str(item["stock"])
-            embed.add_field(
-                name=f"{item['display_name']} — {fmt_price(item['price'])}",
-                value=f"{item['description']}\nStock : {stock_txt}",
-                inline=False,
-            )
-    embed.set_footer(text="Commande avec /buy dans le salon 🛍️-commander")
-    return embed
+        embed = discord.Embed(
+            title=f"🛒 {shop['name']} — Catalogue",
+            description="Le catalogue est vide pour le moment.",
+            color=discord.Color.blurple(),
+        )
+        return [embed]
+
+    embeds = []
+    items = list(shop["items"].values())[:10]
+
+    for item in items:
+        stock_txt = "Illimité" if item["stock"] == -1 else str(item["stock"])
+        embed = discord.Embed(
+            title=item["display_name"],
+            description=item["description"],
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name="Prix", value=fmt_price(item["price"]), inline=True)
+        embed.add_field(name="Stock", value=stock_txt, inline=True)
+        if item.get("image_url"):
+            embed.set_image(url=item["image_url"])
+        embeds.append(embed)
+
+    embeds[-1].set_footer(text="Commande avec /buy dans le salon 🛍️-commander")
+    if len(shop["items"]) > 10:
+        embeds[-1].add_field(
+            name="ℹ️", value=f"+ {len(shop['items']) - 10} autre(s) article(s) non affiché(s) ici", inline=False
+        )
+    return embeds
 
 
 async def refresh_catalogue(shop: dict) -> None:
     channel = bot.get_channel(shop["catalogue_channel_id"])
     if not channel:
         return
-    embed = await build_catalogue_embed(shop)
-    await channel.send(embed=embed)
+    embeds = await build_catalogue_embeds(shop)
+    await channel.send(embeds=embeds)
 
 
 @bot.tree.command(name="shop", description="Republie le catalogue de la boutique")
@@ -440,8 +459,35 @@ async def shop_cmd(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Aucune boutique n'existe. Un admin doit utiliser `/create_shop`.", ephemeral=True)
         return
 
-    embed = await build_catalogue_embed(shop)
-    await interaction.response.send_message(embed=embed)
+    embeds = await build_catalogue_embeds(shop)
+    await interaction.response.send_message(embeds=embeds)
+
+
+# ---------------------------------------------------------------------------
+# /set_image -> attache une photo à un article existant
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="set_image", description="Attache une photo à un article du catalogue")
+@app_commands.describe(nom="Nom de l'article", image="Photo à afficher pour cet article")
+@app_commands.checks.has_permissions(administrator=True)
+async def set_image(interaction: discord.Interaction, nom: str, image: discord.Attachment):
+    data = load_data()
+    shop = get_shop(data, interaction.guild_id)
+
+    if not shop or nom.lower() not in shop["items"]:
+        await interaction.response.send_message("❌ Cet article n'existe pas.", ephemeral=True)
+        return
+
+    if not (image.content_type or "").startswith("image/"):
+        await interaction.response.send_message("❌ Ce fichier n'est pas une image.", ephemeral=True)
+        return
+
+    item = shop["items"][nom.lower()]
+    item["image_url"] = image.url
+    save_data(data)
+
+    await refresh_catalogue(shop)
+    await interaction.response.send_message(f"✅ Image ajoutée pour **{item['display_name']}**.")
 
 
 # ---------------------------------------------------------------------------
@@ -588,7 +634,7 @@ async def import_stock(interaction: discord.Interaction, fichier: discord.Attach
         if parsed is None:
             continue
         nom, stock, description = parsed
-        detected.append((nom, stock, description))
+        detected.append({"nom": nom, "stock": stock, "description": description})
 
     if not detected:
         await interaction.followup.send(
@@ -601,7 +647,9 @@ async def import_stock(interaction: discord.Interaction, fichier: discord.Attach
         )
         return
 
-    recap = "\n".join(f"• **{nom}** — stock : {'illimité' if s == -1 else s}" for nom, s, _d in detected[:20])
+    recap = "\n".join(
+        f"• **{e['nom']}** — stock : {'illimité' if e['stock'] == -1 else e['stock']}" for e in detected[:20]
+    )
     view = ConfirmPriceView(interaction.guild_id, detected)
 
     await interaction.followup.send(
@@ -674,7 +722,7 @@ class PriceModal(discord.ui.Modal, title="Prix des articles détectés"):
     def __init__(self, shop_guild_id: int, detected_items: list):
         super().__init__()
         self.shop_guild_id = shop_guild_id
-        self.detected_items = detected_items  # liste de (nom, stock)
+        self.detected_items = detected_items  # liste de dicts {nom, stock, description, image_url}
 
     prix = discord.ui.TextInput(
         label="Prix à appliquer (en €)",
@@ -698,17 +746,21 @@ class PriceModal(discord.ui.Modal, title="Prix des articles détectés"):
 
         added = []
         for entry in self.detected_items:
-            if len(entry) == 3:
-                nom, stock, description = entry
-            else:
-                nom, stock = entry
-                description = "Aucune description"
-            shop["items"][nom.lower()] = {
+            nom = entry["nom"]
+            stock = entry.get("stock", -1)
+            description = entry.get("description") or "Aucune description"
+            image_url = entry.get("image_url")
+
+            item_data = {
                 "price": prix_val,
                 "stock": stock,
                 "description": description,
                 "display_name": nom,
             }
+            if image_url:
+                item_data["image_url"] = image_url
+
+            shop["items"][nom.lower()] = item_data
             added.append((nom, prix_val, stock))
 
         save_data(data)
@@ -818,7 +870,7 @@ async def import_stock_image(
             if key in seen_noms:
                 continue  # évite les doublons si le même article apparaît sur plusieurs images
             seen_noms.add(key)
-            detected.append((nom, stock))
+            detected.append({"nom": nom, "stock": stock, "image_url": img.url})
 
     if not detected:
         image_word = "les images" if len(images) > 1 else "l'image"
@@ -831,7 +883,9 @@ async def import_stock_image(
         await interaction.followup.send(msg, ephemeral=True)
         return
 
-    recap = "\n".join(f"• **{nom}** — stock : {'illimité' if s == -1 else s}" for nom, s in detected[:20])
+    recap = "\n".join(
+        f"• **{e['nom']}** — stock : {'illimité' if e['stock'] == -1 else e['stock']}" for e in detected[:20]
+    )
     if len(detected) > 20:
         recap += f"\n... et {len(detected) - 20} autre(s)."
 
@@ -840,6 +894,7 @@ async def import_stock_image(
     msg = (
         f"🔎 **{len(detected)} article(s) détecté(s)"
         f"{f' sur {len(images)} image(s)' if len(images) > 1 else ''} :**\n\n{recap}\n\n"
+        f"L'image envoyée sera utilisée comme photo du produit dans le catalogue.\n"
         f"Clique sur le bouton ci-dessous pour indiquer le prix à appliquer et publier dans le catalogue."
     )
     if errors:
@@ -942,6 +997,8 @@ async def create_order_ticket(interaction: discord.Interaction, shop: dict, item
         ),
         color=discord.Color.green(),
     )
+    if item.get("image_url"):
+        ticket_embed.set_thumbnail(url=item["image_url"])
     await ticket_channel.send(embed=ticket_embed)
 
     await interaction.followup.send(
@@ -1257,6 +1314,7 @@ async def commandes_en_attente(interaction: discord.Interaction):
 @import_stock.error
 @import_stock_image.error
 @set_stock.error
+@set_image.error
 @restock.error
 @remove_item.error
 @confirm_paiement.error
