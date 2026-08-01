@@ -10,7 +10,7 @@ Un bot Discord qui crée automatiquement une **vraie boutique organisée en salo
 | `/delete_shop confirmer:oui` | Supprime la boutique et ses salons | Admin |
 | `/set_paypal lien` | Change/ajoute le lien PayPal | Admin |
 | `/import_stock fichier` | Ajoute des articles depuis un fichier (Nom;Stock;Description), demande le prix, puis publie | Admin |
-| `/import_stock_image image` | Lit une photo (nom + stock), demande le prix, puis publie | Admin |
+| `/import_stock_image image1 [image2..5]` | Lit jusqu'à 5 photos (nom + stock), demande le prix, puis publie | Admin |
 | `/set_stock nom stock` | Modifie le stock d'un article existant | Admin |
 | `/restock nom quantite` | Ajoute du stock + annonce le restock aux clients | Admin |
 | `/remove_item nom` | Supprime un article | Admin |
