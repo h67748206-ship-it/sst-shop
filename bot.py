@@ -5,7 +5,8 @@ Commandes disponibles :
   /create_shop nom paypal   -> Crée toute la structure de la boutique (salons) (admin)
   /delete_shop confirmer     -> Supprime la boutique et ses salons (admin)
   /set_paypal lien          -> Change le lien PayPal de la boutique (admin)
-  /add_item                 -> Ajoute un article au catalogue (admin)
+  /import_stock              -> Ajoute plusieurs articles via un fichier (admin)
+  /import_stock_image        -> Ajoute des articles depuis une photo (admin)
   /set_stock                -> Modifie le stock d'un article existant (admin)
   /remove_item               -> Supprime un article (admin)
   /shop                     -> Republie le catalogue
@@ -166,7 +167,7 @@ async def create_shop(interaction: discord.Interaction, nom: str = "Ma Boutique"
     # Message d'accueil dans le salon catalogue
     embed = discord.Embed(
         title=f"🛒 {nom}",
-        description="Le catalogue est vide pour le moment.\nUn admin peut ajouter des articles avec `/add_item`.",
+        description="Le catalogue est vide pour le moment.\nUn admin peut ajouter des articles avec `/import_stock` ou `/import_stock_image`.",
         color=discord.Color.blurple(),
     )
     await catalogue_channel.send(embed=embed)
@@ -292,51 +293,6 @@ async def set_paypal(interaction: discord.Interaction, lien: str):
 
 
 # ---------------------------------------------------------------------------
-# /add_item
-# ---------------------------------------------------------------------------
-
-@bot.tree.command(name="add_item", description="Ajoute un article au catalogue")
-@app_commands.describe(
-    nom="Nom de l'article",
-    prix="Prix en euros (ex: 9.99)",
-    stock="Quantité disponible (-1 pour illimité)",
-    description="Description de l'article",
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def add_item(
-    interaction: discord.Interaction,
-    nom: str,
-    prix: float,
-    stock: int = -1,
-    description: str = "Aucune description",
-):
-    data = load_data()
-    shop = get_shop(data, interaction.guild_id)
-
-    if not shop:
-        await interaction.response.send_message("❌ Aucune boutique trouvée. Utilise `/create_shop` d'abord.", ephemeral=True)
-        return
-
-    if prix < 0:
-        await interaction.response.send_message("❌ Le prix ne peut pas être négatif.", ephemeral=True)
-        return
-
-    shop["items"][nom.lower()] = {
-        "price": prix,
-        "stock": stock,
-        "description": description,
-        "display_name": nom,
-    }
-    save_data(data)
-
-    await refresh_catalogue(shop)
-    await interaction.response.send_message(
-        f"✅ Article **{nom}** ajouté pour **{fmt_price(prix)}** "
-        f"(stock : {'illimité' if stock == -1 else stock})."
-    )
-
-
-# ---------------------------------------------------------------------------
 # /set_stock -> modifie le stock d'un article existant
 # ---------------------------------------------------------------------------
 
@@ -385,7 +341,7 @@ async def restock(interaction: discord.Interaction, nom: str, quantite: int):
 
     if not shop or nom.lower() not in shop["items"]:
         await interaction.response.send_message(
-            "❌ Cet article n'existe pas. Utilise `/add_item` pour le créer d'abord.", ephemeral=True
+            "❌ Cet article n'existe pas. Utilise `/import_stock` ou `/import_stock_image` pour le créer d'abord.", ephemeral=True
         )
         return
 
@@ -582,35 +538,32 @@ async def stock_cmd(interaction: discord.Interaction):
 # ---------------------------------------------------------------------------
 
 def parse_stock_line(line: str):
-    """Parse une ligne 'Nom;Prix;Stock;Description' -> (nom, prix, stock, description) ou None si invalide."""
+    """Parse une ligne 'Nom;Stock;Description' -> (nom, stock, description) ou None si invalide.
+    Le prix n'est PAS dans le fichier : il est demandé après coup via un formulaire."""
     line = line.strip()
     if not line or line.startswith("#"):
         return None
 
     parts = [p.strip() for p in line.split(";")]
-    if len(parts) < 2:
+    if not parts or not parts[0]:
         return None
 
     nom = parts[0]
-    try:
-        prix = float(parts[1].replace(",", "."))
-    except ValueError:
-        return None
 
     stock = -1
-    if len(parts) >= 3 and parts[2] != "":
+    if len(parts) >= 2 and parts[1] != "":
         try:
-            stock = int(parts[2])
+            stock = int(parts[1])
         except ValueError:
             stock = -1
 
-    description = parts[3] if len(parts) >= 4 and parts[3] else "Aucune description"
+    description = parts[2] if len(parts) >= 3 and parts[2] else "Aucune description"
 
-    return nom, prix, stock, description
+    return nom, stock, description
 
 
-@bot.tree.command(name="import_stock", description="Ajoute plusieurs articles d'un coup depuis un fichier texte")
-@app_commands.describe(fichier="Fichier .txt ou .csv, une ligne par article : Nom;Prix;Stock;Description")
+@bot.tree.command(name="import_stock", description="Ajoute plusieurs articles d'un coup depuis un fichier texte, puis demande le prix")
+@app_commands.describe(fichier="Fichier .txt ou .csv, une ligne par article : Nom;Stock;Description")
 @app_commands.checks.has_permissions(administrator=True)
 async def import_stock(interaction: discord.Interaction, fichier: discord.Attachment):
     data = load_data()
@@ -629,51 +582,34 @@ async def import_stock(interaction: discord.Interaction, fichier: discord.Attach
         await interaction.followup.send("❌ Impossible de lire ce fichier. Envoie un fichier texte (.txt ou .csv).", ephemeral=True)
         return
 
-    added = []
-    skipped = 0
-
+    detected = []
     for line in content.splitlines():
         parsed = parse_stock_line(line)
         if parsed is None:
-            if line.strip() and not line.strip().startswith("#"):
-                skipped += 1
             continue
+        nom, stock, description = parsed
+        detected.append((nom, stock, description))
 
-        nom, prix, stock, description = parsed
-        shop["items"][nom.lower()] = {
-            "price": prix,
-            "stock": stock,
-            "description": description,
-            "display_name": nom,
-        }
-        added.append((nom, prix, stock))
-
-    if not added:
+    if not detected:
         await interaction.followup.send(
             "❌ Aucun article valide trouvé dans le fichier.\n"
             "Format attendu, une ligne par article :\n"
-            "`Nom;Prix;Stock;Description`\n"
-            "Exemple : `T-shirt;19.99;10;T-shirt noir taille M`\n"
+            "`Nom;Stock;Description`\n"
+            "Exemple : `T-shirt;10;T-shirt noir taille M`\n"
             "(Stock et Description sont optionnels — laisse Stock vide ou -1 pour illimité)",
             ephemeral=True,
         )
         return
 
-    save_data(data)
-    await refresh_catalogue(shop)
+    recap = "\n".join(f"• **{nom}** — stock : {'illimité' if s == -1 else s}" for nom, s, _d in detected[:20])
+    view = ConfirmPriceView(interaction.guild_id, detected)
 
-    recap = "\n".join(
-        f"• **{nom}** — {fmt_price(prix)} (stock : {'illimité' if s == -1 else s})"
-        for nom, prix, s in added[:20]
+    await interaction.followup.send(
+        f"🔎 **{len(detected)} article(s) détecté(s) dans le fichier :**\n\n{recap}\n\n"
+        f"Clique sur le bouton ci-dessous pour indiquer le prix à appliquer et publier dans le catalogue.",
+        view=view,
+        ephemeral=True,
     )
-    if len(added) > 20:
-        recap += f"\n... et {len(added) - 20} autre(s)."
-
-    msg = f"✅ **{len(added)} article(s) importé(s) avec succès !**\n\n{recap}"
-    if skipped:
-        msg += f"\n\n⚠️ {skipped} ligne(s) ignorée(s) car mal formatée(s)."
-
-    await interaction.followup.send(msg, ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
@@ -734,8 +670,71 @@ def parse_ocr_line(line: str):
     return nom, prix, stock
 
 
-@bot.tree.command(name="import_stock_image", description="Lit une photo de ton stock et ajoute les articles automatiquement")
-@app_commands.describe(image="Photo ou capture d'écran de ta liste de stock")
+class PriceModal(discord.ui.Modal, title="Prix des articles détectés"):
+    def __init__(self, shop_guild_id: int, detected_items: list):
+        super().__init__()
+        self.shop_guild_id = shop_guild_id
+        self.detected_items = detected_items  # liste de (nom, stock)
+
+    prix = discord.ui.TextInput(
+        label="Prix à appliquer (en €)",
+        placeholder="Ex: 9.99",
+        required=True,
+        max_length=10,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            prix_val = float(str(self.prix.value).replace(",", "."))
+        except ValueError:
+            await interaction.response.send_message("❌ Prix invalide, réessaie avec un nombre (ex: 9.99).", ephemeral=True)
+            return
+
+        data = load_data()
+        shop = get_shop(data, self.shop_guild_id)
+        if not shop:
+            await interaction.response.send_message("❌ La boutique n'existe plus.", ephemeral=True)
+            return
+
+        added = []
+        for entry in self.detected_items:
+            if len(entry) == 3:
+                nom, stock, description = entry
+            else:
+                nom, stock = entry
+                description = "Aucune description"
+            shop["items"][nom.lower()] = {
+                "price": prix_val,
+                "stock": stock,
+                "description": description,
+                "display_name": nom,
+            }
+            added.append((nom, prix_val, stock))
+
+        save_data(data)
+        await refresh_catalogue(shop)
+
+        recap = "\n".join(
+            f"• **{nom}** — {fmt_price(p)} (stock : {'illimité' if s == -1 else s})" for nom, p, s in added
+        )
+        await interaction.response.send_message(
+            f"✅ **{len(added)} article(s) publié(s) dans le catalogue !**\n\n{recap}", ephemeral=True
+        )
+
+
+class ConfirmPriceView(discord.ui.View):
+    def __init__(self, guild_id: int, detected_items: list):
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+        self.detected_items = detected_items
+
+    @discord.ui.button(label="💶 Définir le prix et publier", style=discord.ButtonStyle.green)
+    async def set_price(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(PriceModal(self.guild_id, self.detected_items))
+
+
+@bot.tree.command(name="import_stock_image", description="Lit une photo de ton stock, demande le prix, puis publie automatiquement")
+@app_commands.describe(image="Photo ou capture d'écran de ta liste de stock (nom + quantité)")
 @app_commands.checks.has_permissions(administrator=True)
 async def import_stock_image(interaction: discord.Interaction, image: discord.Attachment):
     data = load_data()
@@ -776,51 +775,35 @@ async def import_stock_image(interaction: discord.Interaction, image: discord.At
 
     text = parsed_results[0].get("ParsedText", "")
 
-    added = []
-    skipped_lines = []
+    # 1. On essaie d'abord le format "Nom" + "X exemplaires" (page cadeaux Discord)
+    detected = parse_nom_exemplaires_lines(text)
 
-    for line in text.splitlines():
-        parsed = parse_ocr_line(line)
-        if parsed is None:
-            if line.strip():
-                skipped_lines.append(line.strip())
-            continue
-        nom, prix, stock = parsed
-        shop["items"][nom.lower()] = {
-            "price": prix,
-            "stock": stock,
-            "description": "Aucune description",
-            "display_name": nom,
-        }
-        added.append((nom, prix, stock))
+    # 2. Sinon on retombe sur le format générique nom+nombre(s)
+    if not detected:
+        for line in text.splitlines():
+            parsed = parse_ocr_line(line)
+            if parsed:
+                nom, _prix_ignore, stock = parsed
+                detected.append((nom, stock))
 
-    if not added:
+    if not detected:
         await interaction.followup.send(
-            "❌ Je n'ai réussi à reconnaître aucun article valide dans l'image.\n"
-            "L'OCR fonctionne mieux avec du texte net et imprimé (capture d'écran, liste tapée) "
-            "qu'avec de l'écriture manuscrite.\n"
+            "❌ Je n'ai réussi à reconnaître aucun article dans l'image.\n"
+            "L'OCR fonctionne mieux avec du texte net (capture d'écran) qu'avec de l'écriture manuscrite.\n"
             f"Texte brut détecté :\n```{text[:500]}```",
             ephemeral=True,
         )
         return
 
-    save_data(data)
-    await refresh_catalogue(shop)
+    recap = "\n".join(f"• **{nom}** — stock : {'illimité' if s == -1 else s}" for nom, s in detected[:20])
+    view = ConfirmPriceView(interaction.guild_id, detected)
 
-    recap = "\n".join(
-        f"• **{nom}** — {fmt_price(prix)} (stock : {'illimité' if s == -1 else s})"
-        for nom, prix, s in added[:20]
+    await interaction.followup.send(
+        f"🔎 **{len(detected)} article(s) détecté(s) :**\n\n{recap}\n\n"
+        f"Clique sur le bouton ci-dessous pour indiquer le prix à appliquer et publier dans le catalogue.",
+        view=view,
+        ephemeral=True,
     )
-
-    msg = (
-        f"✅ **{len(added)} article(s) reconnu(s) et importé(s) !**\n\n{recap}\n\n"
-        f"⚠️ Vérifie bien avec `/stock` que tout est correct — la lecture automatique "
-        f"peut se tromper, corrige avec `/set_stock` ou `/add_item` si besoin."
-    )
-    if skipped_lines:
-        msg += f"\n\n{len(skipped_lines)} ligne(s) n'ont pas pu être interprétées comme un article."
-
-    await interaction.followup.send(msg[:1900], ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1229,7 +1212,6 @@ async def commandes_en_attente(interaction: discord.Interaction):
 @create_shop.error
 @delete_shop.error
 @set_paypal.error
-@add_item.error
 @import_stock.error
 @import_stock_image.error
 @set_stock.error
