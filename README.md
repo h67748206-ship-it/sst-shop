@@ -9,8 +9,8 @@ Un bot Discord qui crée automatiquement une **vraie boutique organisée en salo
 | `/create_shop nom paypal` | Crée la boutique + tous ses salons | Admin |
 | `/delete_shop confirmer:oui` | Supprime la boutique et ses salons | Admin |
 | `/set_paypal lien` | Change/ajoute le lien PayPal | Admin |
-| `/add_item nom prix [stock] [description]` | Ajoute un article (prix en €) | Admin |
-| `/import_stock fichier` | Ajoute plusieurs articles d'un coup depuis un fichier | Admin |
+| `/import_stock fichier` | Ajoute des articles depuis un fichier (Nom;Stock;Description), demande le prix, puis publie | Admin |
+| `/import_stock_image image` | Lit une photo (nom + stock), demande le prix, puis publie | Admin |
 | `/set_stock nom stock` | Modifie le stock d'un article existant | Admin |
 | `/restock nom quantite` | Ajoute du stock + annonce le restock aux clients | Admin |
 | `/remove_item nom` | Supprime un article | Admin |
@@ -91,11 +91,17 @@ Si tout fonctionne, tu verras dans la console :
    ```
    → ça crée tous les salons automatiquement.
 
-2. **Ajouter des articles** :
+2. **Ajouter des articles** — crée un fichier texte avec une ligne par article, format `Nom;Stock;Description` :
    ```
-   /add_item nom:T-shirt prix:19.99 stock:10 description:T-shirt noir taille M
+   T-shirt;10;T-shirt noir taille M
    ```
-   → le catalogue se met à jour tout seul dans #📖-catalogue.
+   Puis :
+   ```
+   /import_stock fichier:tonfichier.txt
+   ```
+   → le bot détecte les articles et affiche un bouton **"💶 Définir le prix et publier"**. Clique dessus, indique le prix dans le formulaire qui s'ouvre, et les articles sont publiés automatiquement dans #📖-catalogue.
+
+   Tu peux aussi envoyer directement une **photo** de ta liste de stock avec `/import_stock_image` — même principe (le bot lit le nom et le stock sur l'image, puis te demande le prix).
 
 3. **Un client commande** en tapant simplement `/buy` (n'importe où, ou dans #🛍️-commander) :
    ```
