@@ -18,11 +18,15 @@ Stockage : fichier JSON local (data.json).
 """
 
 import asyncio
+import io
 import json
 import os
+import re
 import discord
+import requests
 from discord import app_commands
 from discord.ext import commands
+from PIL import Image, ImageDraw, ImageFont
 from keep_alive import keep_alive
 
 # ---------------------------------------------------------------------------
@@ -37,6 +41,12 @@ CURRENCY_SYMBOL = "€"
 # commandes /. Réglages Discord > Avancés > Mode développeur, puis clic droit
 # sur le serveur > Copier l'identifiant.
 GUILD_ID = os.getenv("GUILD_ID")
+
+# Clé API pour la lecture de texte sur images (OCR), via ocr.space (gratuit).
+# "helloworld" est une clé de démo publique très limitée (peu de requêtes/jour).
+# Pour un usage fiable, crée ta propre clé gratuite sur https://ocr.space/ocrapi
+# puis mets-la en variable d'environnement OCR_SPACE_API_KEY.
+OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY", "helloworld")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -360,6 +370,62 @@ async def set_stock(interaction: discord.Interaction, nom: str, stock: int):
 
 
 # ---------------------------------------------------------------------------
+# /restock -> ajoute du stock à un article et annonce le restock aux clients
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="restock", description="Ajoute du stock à un article et annonce le restock aux clients")
+@app_commands.describe(
+    nom="Nom de l'article",
+    quantite="Quantité à ajouter au stock actuel",
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def restock(interaction: discord.Interaction, nom: str, quantite: int):
+    data = load_data()
+    shop = get_shop(data, interaction.guild_id)
+
+    if not shop or nom.lower() not in shop["items"]:
+        await interaction.response.send_message(
+            "❌ Cet article n'existe pas. Utilise `/add_item` pour le créer d'abord.", ephemeral=True
+        )
+        return
+
+    if quantite <= 0:
+        await interaction.response.send_message("❌ La quantité doit être supérieure à 0.", ephemeral=True)
+        return
+
+    item = shop["items"][nom.lower()]
+
+    if item["stock"] == -1:
+        await interaction.response.send_message(
+            f"ℹ️ **{item['display_name']}** est déjà en stock illimité, rien à ajouter.", ephemeral=True
+        )
+        return
+
+    item["stock"] += quantite
+    save_data(data)
+    await refresh_catalogue(shop)
+
+    await interaction.response.send_message(
+        f"✅ **+{quantite}** {item['display_name']} ajouté(s). Nouveau stock : **{item['stock']}**."
+    )
+
+    # Annonce automatique du restock dans le salon de commande
+    order_channel = bot.get_channel(shop.get("order_channel_id"))
+    if order_channel:
+        embed = discord.Embed(
+            title="🔄 Restock !",
+            description=(
+                f"**{item['display_name']}** est de retour en stock !\n"
+                f"Quantité disponible : **{item['stock']}**\n"
+                f"Prix : **{fmt_price(item['price'])}**\n\n"
+                f"Clique sur le bouton 🛍️ Commander ci-dessus ou utilise `/buy` pour en profiter !"
+            ),
+            color=discord.Color.blue(),
+        )
+        await order_channel.send(embed=embed)
+
+
+# ---------------------------------------------------------------------------
 # /remove_item
 # ---------------------------------------------------------------------------
 
@@ -420,6 +486,341 @@ async def shop_cmd(interaction: discord.Interaction):
 
     embed = await build_catalogue_embed(shop)
     await interaction.response.send_message(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# /stock -> génère une image récapitulative de tout le stock
+# ---------------------------------------------------------------------------
+
+def generate_stock_image(shop: dict) -> io.BytesIO:
+    """Dessine un tableau (nom, prix, stock) sous forme d'image PNG et le retourne en mémoire."""
+    items = list(shop["items"].values())
+
+    # Polices (fallback sur la police par défaut si aucune police système n'est trouvée)
+    try:
+        font_title = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
+        font_header = ImageFont.truetype("DejaVuSans-Bold.ttf", 20)
+        font_text = ImageFont.truetype("DejaVuSans.ttf", 20)
+    except OSError:
+        font_title = ImageFont.load_default()
+        font_header = ImageFont.load_default()
+        font_text = ImageFont.load_default()
+
+    row_height = 44
+    header_height = 90
+    width = 760
+    height = header_height + row_height * max(len(items), 1) + 30
+
+    bg_color = (30, 33, 36)
+    header_color = (47, 49, 54)
+    row_color_a = (40, 43, 48)
+    row_color_b = (35, 38, 43)
+    text_color = (235, 235, 235)
+    ok_color = (87, 242, 135)
+    low_color = (250, 166, 26)
+    out_color = (237, 66, 69)
+
+    img = Image.new("RGB", (width, height), bg_color)
+    draw = ImageDraw.Draw(img)
+
+    # Titre
+    draw.text((20, 15), f"📦 Stock — {shop['name']}", font=font_title, fill=text_color)
+
+    # En-têtes de colonnes
+    y = header_height
+    draw.rectangle([(0, y - 40), (width, y)], fill=header_color)
+    draw.text((20, y - 34), "Article", font=font_header, fill=text_color)
+    draw.text((450, y - 34), "Prix", font=font_header, fill=text_color)
+    draw.text((580, y - 34), "Stock", font=font_header, fill=text_color)
+
+    if not items:
+        draw.text((20, y + 10), "Aucun article dans le catalogue.", font=font_text, fill=text_color)
+    else:
+        for i, item in enumerate(items):
+            row_color = row_color_a if i % 2 == 0 else row_color_b
+            draw.rectangle([(0, y), (width, y + row_height)], fill=row_color)
+
+            draw.text((20, y + 10), item["display_name"][:40], font=font_text, fill=text_color)
+            draw.text((450, y + 10), fmt_price(item["price"]), font=font_text, fill=text_color)
+
+            if item["stock"] == -1:
+                stock_txt, stock_color = "Illimité", ok_color
+            elif item["stock"] == 0:
+                stock_txt, stock_color = "Rupture", out_color
+            elif item["stock"] <= 5:
+                stock_txt, stock_color = str(item["stock"]), low_color
+            else:
+                stock_txt, stock_color = str(item["stock"]), ok_color
+
+            draw.text((580, y + 10), stock_txt, font=font_text, fill=stock_color)
+            y += row_height
+
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer
+
+
+@bot.tree.command(name="stock", description="Affiche une image récapitulative de tout le stock")
+async def stock_cmd(interaction: discord.Interaction):
+    data = load_data()
+    shop = get_shop(data, interaction.guild_id)
+
+    if not shop:
+        await interaction.response.send_message("❌ Aucune boutique n'existe.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    buffer = generate_stock_image(shop)
+    file = discord.File(buffer, filename="stock.png")
+    await interaction.followup.send(file=file)
+
+
+# ---------------------------------------------------------------------------
+# /import_stock -> ajoute plusieurs articles d'un coup via un fichier texte
+# ---------------------------------------------------------------------------
+
+def parse_stock_line(line: str):
+    """Parse une ligne 'Nom;Prix;Stock;Description' -> (nom, prix, stock, description) ou None si invalide."""
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+
+    parts = [p.strip() for p in line.split(";")]
+    if len(parts) < 2:
+        return None
+
+    nom = parts[0]
+    try:
+        prix = float(parts[1].replace(",", "."))
+    except ValueError:
+        return None
+
+    stock = -1
+    if len(parts) >= 3 and parts[2] != "":
+        try:
+            stock = int(parts[2])
+        except ValueError:
+            stock = -1
+
+    description = parts[3] if len(parts) >= 4 and parts[3] else "Aucune description"
+
+    return nom, prix, stock, description
+
+
+@bot.tree.command(name="import_stock", description="Ajoute plusieurs articles d'un coup depuis un fichier texte")
+@app_commands.describe(fichier="Fichier .txt ou .csv, une ligne par article : Nom;Prix;Stock;Description")
+@app_commands.checks.has_permissions(administrator=True)
+async def import_stock(interaction: discord.Interaction, fichier: discord.Attachment):
+    data = load_data()
+    shop = get_shop(data, interaction.guild_id)
+
+    if not shop:
+        await interaction.response.send_message("❌ Aucune boutique n'existe. Utilise `/create_shop` d'abord.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        raw_bytes = await fichier.read()
+        content = raw_bytes.decode("utf-8")
+    except Exception:
+        await interaction.followup.send("❌ Impossible de lire ce fichier. Envoie un fichier texte (.txt ou .csv).", ephemeral=True)
+        return
+
+    added = []
+    skipped = 0
+
+    for line in content.splitlines():
+        parsed = parse_stock_line(line)
+        if parsed is None:
+            if line.strip() and not line.strip().startswith("#"):
+                skipped += 1
+            continue
+
+        nom, prix, stock, description = parsed
+        shop["items"][nom.lower()] = {
+            "price": prix,
+            "stock": stock,
+            "description": description,
+            "display_name": nom,
+        }
+        added.append((nom, prix, stock))
+
+    if not added:
+        await interaction.followup.send(
+            "❌ Aucun article valide trouvé dans le fichier.\n"
+            "Format attendu, une ligne par article :\n"
+            "`Nom;Prix;Stock;Description`\n"
+            "Exemple : `T-shirt;19.99;10;T-shirt noir taille M`\n"
+            "(Stock et Description sont optionnels — laisse Stock vide ou -1 pour illimité)",
+            ephemeral=True,
+        )
+        return
+
+    save_data(data)
+    await refresh_catalogue(shop)
+
+    recap = "\n".join(
+        f"• **{nom}** — {fmt_price(prix)} (stock : {'illimité' if s == -1 else s})"
+        for nom, prix, s in added[:20]
+    )
+    if len(added) > 20:
+        recap += f"\n... et {len(added) - 20} autre(s)."
+
+    msg = f"✅ **{len(added)} article(s) importé(s) avec succès !**\n\n{recap}"
+    if skipped:
+        msg += f"\n\n⚠️ {skipped} ligne(s) ignorée(s) car mal formatée(s)."
+
+    await interaction.followup.send(msg, ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# /import_stock_image -> lit une photo/capture de stock via OCR et ajoute les articles
+# ---------------------------------------------------------------------------
+
+def parse_nom_exemplaires_lines(text: str):
+    """Reconnaît le format de la page 'Cadeaux' Discord : une ligne avec le nom,
+    suivie d'une ligne 'X exemplaires' (ou 'X exemplaire'). Retourne une liste de (nom, stock)."""
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    results = []
+
+    for i, line in enumerate(lines):
+        match = re.match(r"^(\d+)\s*exemplaires?$", line, re.IGNORECASE)
+        if match and i > 0:
+            stock = int(match.group(1))
+            nom = lines[i - 1]
+            # Évite de reprendre une ligne déjà utilisée comme "stock" par erreur
+            if not re.match(r"^\d+\s*exemplaires?$", nom, re.IGNORECASE):
+                results.append((nom, stock))
+
+    return results
+
+
+def parse_ocr_line(line: str):
+    """Essaie d'extraire (nom, prix, stock) d'une ligne de texte brut détectée par l'OCR.
+    Heuristique : le dernier nombre = stock, l'avant-dernier = prix, le reste = nom.
+    S'il n'y a qu'un seul nombre, on suppose que c'est le prix (stock = illimité)."""
+    line = line.strip()
+    if not line:
+        return None
+
+    numbers = re.findall(r"\d+[.,]\d+|\d+", line)
+    if not numbers:
+        return None
+
+    first_num_match = re.search(r"\d", line)
+    nom = line[: first_num_match.start()].strip(" -:;\t.,")
+    if not nom or len(nom) < 2:
+        return None
+
+    if len(numbers) >= 2:
+        try:
+            prix = float(numbers[-2].replace(",", "."))
+        except ValueError:
+            return None
+        try:
+            stock = int(float(numbers[-1].replace(",", ".")))
+        except ValueError:
+            stock = -1
+    else:
+        try:
+            prix = float(numbers[0].replace(",", "."))
+        except ValueError:
+            return None
+        stock = -1
+
+    return nom, prix, stock
+
+
+@bot.tree.command(name="import_stock_image", description="Lit une photo de ton stock et ajoute les articles automatiquement")
+@app_commands.describe(image="Photo ou capture d'écran de ta liste de stock")
+@app_commands.checks.has_permissions(administrator=True)
+async def import_stock_image(interaction: discord.Interaction, image: discord.Attachment):
+    data = load_data()
+    shop = get_shop(data, interaction.guild_id)
+
+    if not shop:
+        await interaction.response.send_message("❌ Aucune boutique n'existe. Utilise `/create_shop` d'abord.", ephemeral=True)
+        return
+
+    if not (image.content_type or "").startswith("image/"):
+        await interaction.response.send_message("❌ Ce fichier n'est pas une image.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        response = requests.post(
+            "https://api.ocr.space/parse/image",
+            data={"apikey": OCR_SPACE_API_KEY, "language": "fre", "OCREngine": "2"},
+            files={"file": (image.filename, await image.read(), image.content_type)},
+            timeout=30,
+        )
+        result = response.json()
+    except Exception as e:
+        await interaction.followup.send(f"❌ Erreur lors de la lecture de l'image : {e}", ephemeral=True)
+        return
+
+    if result.get("IsErroredOnProcessing"):
+        await interaction.followup.send(
+            f"❌ L'OCR n'a pas pu lire l'image : {result.get('ErrorMessage', 'erreur inconnue')}", ephemeral=True
+        )
+        return
+
+    parsed_results = result.get("ParsedResults") or []
+    if not parsed_results:
+        await interaction.followup.send("❌ Aucun texte détecté dans l'image.", ephemeral=True)
+        return
+
+    text = parsed_results[0].get("ParsedText", "")
+
+    added = []
+    skipped_lines = []
+
+    for line in text.splitlines():
+        parsed = parse_ocr_line(line)
+        if parsed is None:
+            if line.strip():
+                skipped_lines.append(line.strip())
+            continue
+        nom, prix, stock = parsed
+        shop["items"][nom.lower()] = {
+            "price": prix,
+            "stock": stock,
+            "description": "Aucune description",
+            "display_name": nom,
+        }
+        added.append((nom, prix, stock))
+
+    if not added:
+        await interaction.followup.send(
+            "❌ Je n'ai réussi à reconnaître aucun article valide dans l'image.\n"
+            "L'OCR fonctionne mieux avec du texte net et imprimé (capture d'écran, liste tapée) "
+            "qu'avec de l'écriture manuscrite.\n"
+            f"Texte brut détecté :\n```{text[:500]}```",
+            ephemeral=True,
+        )
+        return
+
+    save_data(data)
+    await refresh_catalogue(shop)
+
+    recap = "\n".join(
+        f"• **{nom}** — {fmt_price(prix)} (stock : {'illimité' if s == -1 else s})"
+        for nom, prix, s in added[:20]
+    )
+
+    msg = (
+        f"✅ **{len(added)} article(s) reconnu(s) et importé(s) !**\n\n{recap}\n\n"
+        f"⚠️ Vérifie bien avec `/stock` que tout est correct — la lecture automatique "
+        f"peut se tromper, corrige avec `/set_stock` ou `/add_item` si besoin."
+    )
+    if skipped_lines:
+        msg += f"\n\n{len(skipped_lines)} ligne(s) n'ont pas pu être interprétées comme un article."
+
+    await interaction.followup.send(msg[:1900], ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
@@ -725,6 +1126,14 @@ async def confirm_paiement(interaction: discord.Interaction, id_commande: str):
 
     await interaction.response.send_message(f"✅ Commande #{id_commande} marquée comme payée.")
 
+    # Retire le préfixe ⏳ du ticket puisqu'il n'est plus en attente
+    ticket = interaction.guild.get_channel(order.get("ticket_channel_id")) if order.get("ticket_channel_id") else None
+    if ticket and ticket.name.startswith("⏳"):
+        try:
+            await ticket.edit(name=f"✅-commande-{id_commande}")
+        except discord.HTTPException:
+            pass
+
     buyer = interaction.guild.get_member(order["user_id"])
     order_channel = bot.get_channel(shop["order_channel_id"])
     if buyer and order_channel:
@@ -784,6 +1193,8 @@ async def commandes_en_attente(interaction: discord.Interaction):
         await interaction.response.send_message("✅ Aucune commande en attente de paiement pour le moment.", ephemeral=True)
         return
 
+    await interaction.response.defer(ephemeral=True)
+
     embed = discord.Embed(
         title=f"⏳ Commandes en attente ({len(pending)})",
         color=discord.Color.orange(),
@@ -793,6 +1204,14 @@ async def commandes_en_attente(interaction: discord.Interaction):
         client_txt = member.mention if member else f"<@{o['user_id']}>"
         ticket = interaction.guild.get_channel(o.get("ticket_channel_id")) if o.get("ticket_channel_id") else None
         ticket_txt = ticket.mention if ticket else "*ticket introuvable*"
+
+        # Renomme le salon du ticket pour le rendre repérable d'un coup d'œil
+        if ticket and not ticket.name.startswith("⏳"):
+            try:
+                await ticket.edit(name=f"⏳-commande-{oid}")
+            except discord.HTTPException:
+                pass  # Limite de renommage Discord atteinte, on ignore silencieusement
+
         embed.add_field(
             name=f"Commande #{oid}",
             value=f"Client : {client_txt}\nArticle : {o['quantite']}x {o['item']}\nTotal : {fmt_price(o['total'])}\nTicket : {ticket_txt}",
@@ -800,7 +1219,7 @@ async def commandes_en_attente(interaction: discord.Interaction):
         )
     embed.set_footer(text="Utilise /confirm_paiement id_commande:X une fois le paiement reçu")
 
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
@@ -811,7 +1230,10 @@ async def commandes_en_attente(interaction: discord.Interaction):
 @delete_shop.error
 @set_paypal.error
 @add_item.error
+@import_stock.error
+@import_stock_image.error
 @set_stock.error
+@restock.error
 @remove_item.error
 @confirm_paiement.error
 @commandes_en_attente.error
