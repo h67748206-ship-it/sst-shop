@@ -442,12 +442,22 @@ async def build_catalogue_embeds(shop: dict) -> list:
     return embeds
 
 
-async def refresh_catalogue(shop: dict) -> None:
+async def refresh_catalogue(shop: dict) -> bool:
+    """Republie le catalogue dans le salon dédié. Retourne True si ça a réussi, False sinon."""
     channel = bot.get_channel(shop["catalogue_channel_id"])
     if not channel:
-        return
+        # Le salon n'est pas encore en cache (ex: juste après un redémarrage du bot) -> on le récupère via l'API
+        try:
+            channel = await bot.fetch_channel(shop["catalogue_channel_id"])
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return False
+
     embeds = await build_catalogue_embeds(shop)
-    await channel.send(embeds=embeds)
+    try:
+        await channel.send(embeds=embeds)
+    except discord.HTTPException:
+        return False
+    return True
 
 
 @bot.tree.command(name="shop", description="Republie le catalogue de la boutique")
@@ -764,14 +774,19 @@ class PriceModal(discord.ui.Modal, title="Prix des articles détectés"):
             added.append((nom, prix_val, stock))
 
         save_data(data)
-        await refresh_catalogue(shop)
+        catalogue_ok = await refresh_catalogue(shop)
 
         recap = "\n".join(
             f"• **{nom}** — {fmt_price(p)} (stock : {'illimité' if s == -1 else s})" for nom, p, s in added
         )
-        await interaction.response.send_message(
-            f"✅ **{len(added)} article(s) publié(s) dans le catalogue !**\n\n{recap}", ephemeral=True
-        )
+        msg = f"✅ **{len(added)} article(s) enregistré(s) !**\n\n{recap}"
+        if not catalogue_ok:
+            msg += (
+                "\n\n⚠️ Les articles sont bien enregistrés, mais je n'ai pas réussi à publier "
+                "le catalogue dans #📖-catalogue (salon introuvable ou permissions insuffisantes). "
+                "Utilise `/shop` pour republier le catalogue manuellement."
+            )
+        await interaction.response.send_message(msg, ephemeral=True)
 
 
 class ConfirmPriceView(discord.ui.View):
