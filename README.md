@@ -10,9 +10,12 @@ Un bot Discord qui crée automatiquement une **vraie boutique organisée en salo
 | `/delete_shop confirmer:oui` | Supprime la boutique et ses salons | Admin |
 | `/set_paypal lien` | Change/ajoute le lien PayPal | Admin |
 | `/add_item nom prix [stock] [description]` | Ajoute un article (prix en €) | Admin |
+| `/import_stock fichier` | Ajoute plusieurs articles d'un coup depuis un fichier | Admin |
 | `/set_stock nom stock` | Modifie le stock d'un article existant | Admin |
+| `/restock nom quantite` | Ajoute du stock + annonce le restock aux clients | Admin |
 | `/remove_item nom` | Supprime un article | Admin |
 | `/shop` | Republie le catalogue | Tout le monde |
+| `/stock` | Affiche une image récapitulative du stock | Tout le monde |
 | `/buy` | Affiche un menu déroulant pour choisir un article → ouvre un ticket privé | Tout le monde |
 | `/close_ticket` | Ferme le ticket de commande en cours | Client concerné / Admin |
 | `/paypal` | Affiche simplement le lien PayPal de la boutique | Tout le monde |
