@@ -73,6 +73,8 @@ def fmt_price(amount: float) -> str:
 
 @bot.event
 async def on_ready():
+    bot.add_view(BuyButtonView())  # Rend le bouton "Commander" cliquable même après un redémarrage
+
     try:
         if GUILD_ID:
             guild = discord.Object(id=int(GUILD_ID))
@@ -181,13 +183,13 @@ async def create_shop(interaction: discord.Interaction, nom: str = "Ma Boutique"
         )
     await payment_channel.send(embed=pay_embed)
 
-    # Message d'accueil dans le salon de commande
+    # Message d'accueil dans le salon de commande, avec bouton permanent
     order_embed = discord.Embed(
         title="🛍️ Passer commande",
-        description="Utilise `/buy nom:<article> quantite:<nombre>` ici pour commander.",
+        description="Clique sur le bouton ci-dessous ou utilise `/buy` pour choisir un article.",
         color=discord.Color.green(),
     )
-    await order_channel.send(embed=order_embed)
+    await order_channel.send(embed=order_embed, view=BuyButtonView())
 
     await interaction.followup.send(
         f"✅ Boutique **{nom}** créée avec succès !\n"
@@ -556,12 +558,8 @@ class ShopSelectView(discord.ui.View):
         self.add_item(ItemSelect(shop))
 
 
-# ---------------------------------------------------------------------------
-# /buy -> affiche un menu déroulant pour choisir l'article à commander
-# ---------------------------------------------------------------------------
-
-@bot.tree.command(name="buy", description="Choisir un article à acheter (ouvre un ticket privé)")
-async def buy(interaction: discord.Interaction):
+async def show_buy_menu(interaction: discord.Interaction):
+    """Affiche le menu déroulant des articles. Utilisé par /buy et par le bouton permanent."""
     data = load_data()
     shop = get_shop(data, interaction.guild_id)
 
@@ -577,6 +575,26 @@ async def buy(interaction: discord.Interaction):
     await interaction.response.send_message(
         "🛍️ Sélectionne l'article que tu veux commander :", view=view, ephemeral=True
     )
+
+
+class BuyButtonView(discord.ui.View):
+    """Vue persistante avec un bouton 'Commander' toujours cliquable, même après redémarrage du bot."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🛍️ Commander", style=discord.ButtonStyle.green, custom_id="shop_buy_button_persistent")
+    async def buy_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await show_buy_menu(interaction)
+
+
+# ---------------------------------------------------------------------------
+# /buy -> affiche un menu déroulant pour choisir l'article à commander
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="buy", description="Choisir un article à acheter (ouvre un ticket privé)")
+async def buy(interaction: discord.Interaction):
+    await show_buy_menu(interaction)
 
 
 # ---------------------------------------------------------------------------
@@ -617,6 +635,35 @@ async def close_ticket(interaction: discord.Interaction):
         await interaction.channel.delete(reason=f"Ticket fermé par {interaction.user}")
     except discord.HTTPException:
         pass
+
+
+# ---------------------------------------------------------------------------
+# /paypal -> affiche simplement le lien PayPal de la boutique
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="paypal", description="Affiche le lien PayPal de la boutique")
+async def paypal_cmd(interaction: discord.Interaction):
+    data = load_data()
+    shop = get_shop(data, interaction.guild_id)
+
+    if not shop:
+        await interaction.response.send_message("❌ Aucune boutique n'existe.", ephemeral=True)
+        return
+
+    paypal_link = shop.get("paypal", "").strip()
+    if not paypal_link:
+        await interaction.response.send_message(
+            "❌ Le lien PayPal n'est pas encore configuré. Un admin doit utiliser `/set_paypal`.",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title="💳 Lien PayPal",
+        description=f"[Cliquez ici pour payer]({paypal_link})\n\n{paypal_link}",
+        color=discord.Color.gold(),
+    )
+    await interaction.response.send_message(embed=embed)
 
 
 # ---------------------------------------------------------------------------
@@ -716,6 +763,47 @@ async def mes_commandes(interaction: discord.Interaction):
 
 
 # ---------------------------------------------------------------------------
+# /commandes_en_attente -> liste les commandes non payées (admin)
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="commandes_en_attente", description="Liste les commandes pas encore payées (admin)")
+@app_commands.checks.has_permissions(administrator=True)
+async def commandes_en_attente(interaction: discord.Interaction):
+    data = load_data()
+    shop = get_shop(data, interaction.guild_id)
+
+    if not shop:
+        await interaction.response.send_message("❌ Aucune boutique n'existe.", ephemeral=True)
+        return
+
+    pending = {
+        oid: o for oid, o in shop["orders"].items() if o["status"] == "en attente de paiement"
+    }
+
+    if not pending:
+        await interaction.response.send_message("✅ Aucune commande en attente de paiement pour le moment.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=f"⏳ Commandes en attente ({len(pending)})",
+        color=discord.Color.orange(),
+    )
+    for oid, o in pending.items():
+        member = interaction.guild.get_member(o["user_id"])
+        client_txt = member.mention if member else f"<@{o['user_id']}>"
+        ticket = interaction.guild.get_channel(o.get("ticket_channel_id")) if o.get("ticket_channel_id") else None
+        ticket_txt = ticket.mention if ticket else "*ticket introuvable*"
+        embed.add_field(
+            name=f"Commande #{oid}",
+            value=f"Client : {client_txt}\nArticle : {o['quantite']}x {o['item']}\nTotal : {fmt_price(o['total'])}\nTicket : {ticket_txt}",
+            inline=False,
+        )
+    embed.set_footer(text="Utilise /confirm_paiement id_commande:X une fois le paiement reçu")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
 # Gestion des erreurs de permissions
 # ---------------------------------------------------------------------------
 
@@ -726,6 +814,7 @@ async def mes_commandes(interaction: discord.Interaction):
 @set_stock.error
 @remove_item.error
 @confirm_paiement.error
+@commandes_en_attente.error
 async def permission_error_handler(interaction: discord.Interaction, error):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message("🚫 Tu dois être administrateur pour utiliser cette commande.", ephemeral=True)
