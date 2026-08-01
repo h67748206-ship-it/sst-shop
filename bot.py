@@ -733,48 +733,28 @@ class ConfirmPriceView(discord.ui.View):
         await interaction.response.send_modal(PriceModal(self.guild_id, self.detected_items))
 
 
-@bot.tree.command(name="import_stock_image", description="Lit une photo de ton stock, demande le prix, puis publie automatiquement")
-@app_commands.describe(image="Photo ou capture d'écran de ta liste de stock (nom + quantité)")
-@app_commands.checks.has_permissions(administrator=True)
-async def import_stock_image(interaction: discord.Interaction, image: discord.Attachment):
-    data = load_data()
-    shop = get_shop(data, interaction.guild_id)
-
-    if not shop:
-        await interaction.response.send_message("❌ Aucune boutique n'existe. Utilise `/create_shop` d'abord.", ephemeral=True)
-        return
-
-    if not (image.content_type or "").startswith("image/"):
-        await interaction.response.send_message("❌ Ce fichier n'est pas une image.", ephemeral=True)
-        return
-
-    await interaction.response.defer(ephemeral=True)
-
-    try:
-        response = requests.post(
-            "https://api.ocr.space/parse/image",
-            data={"apikey": OCR_SPACE_API_KEY, "language": "fre", "OCREngine": "2"},
-            files={"file": (image.filename, await image.read(), image.content_type)},
-            timeout=30,
-        )
-        result = response.json()
-    except Exception as e:
-        await interaction.followup.send(f"❌ Erreur lors de la lecture de l'image : {e}", ephemeral=True)
-        return
+async def ocr_extract_text(image: discord.Attachment) -> str:
+    """Envoie une image à l'API OCR et retourne le texte détecté (ou lève une exception)."""
+    response = requests.post(
+        "https://api.ocr.space/parse/image",
+        data={"apikey": OCR_SPACE_API_KEY, "language": "fre", "OCREngine": "2"},
+        files={"file": (image.filename, await image.read(), image.content_type)},
+        timeout=30,
+    )
+    result = response.json()
 
     if result.get("IsErroredOnProcessing"):
-        await interaction.followup.send(
-            f"❌ L'OCR n'a pas pu lire l'image : {result.get('ErrorMessage', 'erreur inconnue')}", ephemeral=True
-        )
-        return
+        raise ValueError(result.get("ErrorMessage", "erreur OCR inconnue"))
 
     parsed_results = result.get("ParsedResults") or []
     if not parsed_results:
-        await interaction.followup.send("❌ Aucun texte détecté dans l'image.", ephemeral=True)
-        return
+        return ""
 
-    text = parsed_results[0].get("ParsedText", "")
+    return parsed_results[0].get("ParsedText", "")
 
+
+def extract_items_from_text(text: str):
+    """Applique les heuristiques de détection d'articles sur un texte OCR."""
     # 1. On essaie d'abord le format "Nom" + "X exemplaires" (page cadeaux Discord)
     detected = parse_nom_exemplaires_lines(text)
 
@@ -786,24 +766,86 @@ async def import_stock_image(interaction: discord.Interaction, image: discord.At
                 nom, _prix_ignore, stock = parsed
                 detected.append((nom, stock))
 
+    return detected
+
+
+@bot.tree.command(name="import_stock_image", description="Lit une ou plusieurs photos de ton stock, demande le prix, puis publie")
+@app_commands.describe(
+    image1="Photo ou capture d'écran de ta liste de stock (nom + quantité)",
+    image2="Image supplémentaire (optionnel)",
+    image3="Image supplémentaire (optionnel)",
+    image4="Image supplémentaire (optionnel)",
+    image5="Image supplémentaire (optionnel)",
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def import_stock_image(
+    interaction: discord.Interaction,
+    image1: discord.Attachment,
+    image2: discord.Attachment = None,
+    image3: discord.Attachment = None,
+    image4: discord.Attachment = None,
+    image5: discord.Attachment = None,
+):
+    data = load_data()
+    shop = get_shop(data, interaction.guild_id)
+
+    if not shop:
+        await interaction.response.send_message("❌ Aucune boutique n'existe. Utilise `/create_shop` d'abord.", ephemeral=True)
+        return
+
+    images = [img for img in [image1, image2, image3, image4, image5] if img is not None]
+
+    for img in images:
+        if not (img.content_type or "").startswith("image/"):
+            await interaction.response.send_message(f"❌ **{img.filename}** n'est pas une image.", ephemeral=True)
+            return
+
+    await interaction.response.defer(ephemeral=True)
+
+    detected = []
+    seen_noms = set()
+    errors = []
+
+    for img in images:
+        try:
+            text = await ocr_extract_text(img)
+        except Exception as e:
+            errors.append(f"{img.filename} : {e}")
+            continue
+
+        for nom, stock in extract_items_from_text(text):
+            key = nom.lower()
+            if key in seen_noms:
+                continue  # évite les doublons si le même article apparaît sur plusieurs images
+            seen_noms.add(key)
+            detected.append((nom, stock))
+
     if not detected:
-        await interaction.followup.send(
-            "❌ Je n'ai réussi à reconnaître aucun article dans l'image.\n"
-            "L'OCR fonctionne mieux avec du texte net (capture d'écran) qu'avec de l'écriture manuscrite.\n"
-            f"Texte brut détecté :\n```{text[:500]}```",
-            ephemeral=True,
+        image_word = "les images" if len(images) > 1 else "l'image"
+        msg = (
+            f"❌ Je n'ai réussi à reconnaître aucun article dans {image_word}.\n"
+            "L'OCR fonctionne mieux avec du texte net (capture d'écran) qu'avec de l'écriture manuscrite."
         )
+        if errors:
+            msg += "\n\nErreurs :\n" + "\n".join(f"• {e}" for e in errors)
+        await interaction.followup.send(msg, ephemeral=True)
         return
 
     recap = "\n".join(f"• **{nom}** — stock : {'illimité' if s == -1 else s}" for nom, s in detected[:20])
+    if len(detected) > 20:
+        recap += f"\n... et {len(detected) - 20} autre(s)."
+
     view = ConfirmPriceView(interaction.guild_id, detected)
 
-    await interaction.followup.send(
-        f"🔎 **{len(detected)} article(s) détecté(s) :**\n\n{recap}\n\n"
-        f"Clique sur le bouton ci-dessous pour indiquer le prix à appliquer et publier dans le catalogue.",
-        view=view,
-        ephemeral=True,
+    msg = (
+        f"🔎 **{len(detected)} article(s) détecté(s)"
+        f"{f' sur {len(images)} image(s)' if len(images) > 1 else ''} :**\n\n{recap}\n\n"
+        f"Clique sur le bouton ci-dessous pour indiquer le prix à appliquer et publier dans le catalogue."
     )
+    if errors:
+        msg += "\n\n⚠️ Certaines images n'ont pas pu être lues :\n" + "\n".join(f"• {e}" for e in errors)
+
+    await interaction.followup.send(msg[:1900], view=view, ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
